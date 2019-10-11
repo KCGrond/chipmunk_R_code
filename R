@@ -1,0 +1,260 @@
+library(dada2)
+path <- "/Volumes/shird/Kirsten/Shorebird_guts/seqs" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq*", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq*", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names
+
+plotQualityProfile(fnFs[1:2]) # visualizing the quality profiles of the forward reads
+plotQualityProfile(fnRs[1:2]) # visualizing the quality profiles of the reverse reads
+
+filt_path <- file.path(path, "filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+out
+errF <- learnErrors(filtFs, multithread=TRUE) # estimate error rates in forward sequences
+errR <- learnErrors(filtRs, multithread=TRUE) # estimate error rates in reverse sequences
+
+#plotErrors(errF, nominalQ=TRUE) # visualize estimated error rates
+
+# dereplicate filtered fastq files
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE) #Infer the sequence variants in each sample
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+#merge denoised forward and reverse reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#construct sequence table
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#Remove chimeric sequences:
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+#Track sequences through pipeline. See if there is one step that loses too many reads. 
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+taxa <- assignTaxonomy(seqtab.nochim, "/Volumes/shird/Kirsten/Shorebird_guts/seqs/silva_nr_v128_train_set.fa", multithread=TRUE)
+taxa <- addSpecies(taxa, "/Volumes/shird/Kirsten/Shorebird_guts/seqs/silva_species_assignment_v128.fa")
+
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+###Create a tree####
+library(doParallel)
+library(foreach)
+library(DECIPHER)
+library(phangorn)
+#Create multiple denovo alignment
+seqs <- getSequences(taxa)
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE)
+
+#construct a neighbor-joining tree, and then fit a Generalized time-reversible with Gamma rate variation
+#maximum likelihood tree using the neighbor-joining tree as a starting point.
+phangAlign <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phangAlign)
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+                    rearrangement = "stochastic", control = pml.control(trace = 0))
+detach("package:phangorn", unload=TRUE)
+
+
+###########################Decontam###########################
+library(decontam)
+
+sample_data(ps_chip)$is.neg <- sample_data(ps_chip)$Sample_or_control == "control"
+contamdf.prev <- isContaminant(ps_chip, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+
+head(which(contamdf.prev$contaminant))
+
+contamdf.prev05 <- isContaminant(ps_chip, method="prevalence", neg="is.neg", threshold=0.1)
+table(contamdf.prev05$contaminant)
+
+#Make phyloseq object of presence-absence in negative controls
+ps.neg <- prune_samples(sample_data(ps_chip)$Sample_or_control == "control", ps_chip)
+ps.neg.presence <- transform_sample_counts(ps.neg, function(abund) 1*(abund>0))
+# Make phyloseq object of presence-absence in true positive samples
+ps.pos <- prune_samples(sample_data(ps)$Sample_or_Control == "True Sample", ps)
+ps.pos.presence <- transform_sample_counts(ps.pos, function(abund) 1*(abund>0))
+# Make data.frame of prevalence in positive and negative samples
+df.pres <- data.frame(prevalence.pos=taxa_sums(ps.pos.presence), prevalence.neg=taxa_sums(ps.neg.presence),
+                      contam.prev=contamdf.prev$contaminant)
+ggplot(data=df.pres, aes(x=prevalence.neg, y=prevalence.pos, color=contam.prev)) + geom_point()
+
+
+###########################Construct phyloseq object###########################
+library(phyloseq)
+library(ggplot2)
+
+metadata_chip = read.table(file="metadata_chipmunk_tree.csv", sep=",", header=TRUE, row.names = c(1))
+attach(metadata_chip)
+
+#construct phyloseq object
+
+ps_chip <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(metadata_chip), 
+               tax_table(taxa),phy_tree(fitGTR$tree))
+
+#remove non-target
+ps_chip <- ps_chip %>%
+  subset_taxa(
+    Kingdom == "Bacteria" &
+      Family  != "mitochondria" &
+      Class   != "Chloroplast"
+  )
+
+###########################Calculate Richness###########################
+#rarefy to lowest sample size (15632)
+ps_chip_rar<- prune_samples(sample_sums(ps_chip)>15643, ps_chip)
+
+#make richness matrices
+nsamp = nsamples(ps_chip_rar)
+trials = 100
+
+observed <- matrix(nrow = nsamp, ncol = trials)
+row.names(observed) <- sample_names(ps_chip_rar)
+
+shannon <- matrix(nrow = nsamp, ncol = trials)
+row.names(shannon) <- sample_names(ps_chip_rar)
+
+evenness <- matrix(nrow = nsamp, ncol = trials)
+row.names(evenness) <- sample_names(ps_chip_rar)
+
+set.seed(3)
+for (i in 1:100) {
+  # Subsample
+  r <- rarefy_even_depth(ps_chip_rar, sample.size = 15632, verbose = FALSE, replace = TRUE)
+  
+  # Calculate richness
+  obs <- as.numeric(as.matrix(estimate_richness(r, measures = "Observed")))
+  observed[ ,i] <- obs
+  
+  # Calculate diversity
+  obs <- as.numeric(as.matrix(estimate_richness(r, measures = "Shannon")))
+  shannon[ ,i] <- obs
+  
+  # Calculate evenness
+  even <- as.numeric(as.matrix(estimate_richness(r, measures = "InvSimpson")))
+  evenness[ ,i] <- even
+  
+}
+
+########################### Calculate and plot NMDS ###########################
+
+nmds.species<- ordinate(ps_chip, method="NMDS", distance="Bray")
+plot.species<- plot_ordination(ps_chip, nmds.species) + theme(panel.background = element_rect(fill="white", colour="black", size=0.5, linetype="solid"),panel.grid.major = element_blank(),
+                                                        panel.grid.minor = element_blank(), axis.text=element_text(size=11),
+                                                        axis.title=element_text(size=11), legend.title=element_text(size=10,face="bold"), 
+                                                        legend.text=element_text(size=10, face = "italic"),legend.position=c(0.86,0.81),legend.key = element_rect(size = 2.3),
+                                                        legend.key.size = unit(0.8, 'lines')) + geom_point(aes(color=species), size=2.5) + labs(col = "species")#+ scale_colour_manual(values=c("amoenus" = "purple", "minimus" = "gold", "ruficaudus" = "indianred4", "quadrivittatus" = "grey", "minimus" = "yellow", "umbrinus" = "red", "dorsalis" = "green"))
+
+
+########################### Calculate homogeneity of variance ###########################
+
+library(vegan)
+library(phyloseq)
+bray.chip<- distance(ps_chip, method="bray")
+sample_data<-sample_data(ps_chip)
+beta_chip<-betadisper(bray.chip, sample_data$Species, type = c("centroid"))
+anova(beta_chip)
+
+########################### Permanova by site for 3 distances ###########################
+
+permanova_chip_bray<- adonis2(distance(ps_chip, method="bray", by = "margin") ~ site+species+state+subspecies+sex,
+                              data = metadata_adonis)
+
+wunifrac<-UniFrac(ps_chip, weighted=TRUE)
+permanova_chip_wunifrac<- adonis2(wunifrac~ site+species+state+subspecies+sex, by = "margin", data = metadata_adonis)
+
+uunifrac<-UniFrac(ps_chip, weighted=FALSE)
+permanova_chip_uunifrac<- adonis2(uunifrac~ site+species+state+subspecies+sex, by = "margin", data = metadata_adonis)
+
+
+########################### make microbiome trees ###########################
+
+bray<-vegdist(ASV_table_chip, method="bray")
+tree_microbiome_bray<-upgma(bray)
+tree_microbiome_bray<-plot(tree_microbiome_bray)
+
+#make weighted unifrac matrix &tree
+w_unifrac<-UniFrac(ps_chip, weighted=TRUE)
+tree_microbiome_weighted <- upgma(w_unifrac)
+tree_microbiome_wunifrac<-plot(tree_microbiome_weighted)
+
+#make unweighted unifrac matrix &tree
+u_unifrac<-UniFrac(ps_chip, weighted=FALSE)
+tree_microbiome_unweighted <- upgma(u_unifrac)
+plot(tree_microbiome_unweighted)
+
+########################### make phylogenetic trees & calculate RF distances ##########
+
+#import tree
+tree_ACR<- read_tree("/Volumes/shird/Kirsten/Chipmunk/Phylogeny_data/ACR/supportOnBestML_ACR.tre",tree.names = NULL, force.multi = FALSE)
+par(mar=rep(0, 4), xpd = NA) 
+
+tree_microbiome_bray_ACR<-multi2di(tree_microbiome_bray_ACR,random=TRUE)
+
+# Ran the following lines after getting a non-binary error. It randomly bifurcates zero length branches.
+tree_ACR<-multi2di(tree_ACR,random=TRUE)
+RF.dist_ACR_bray<-RF.dist(tree_microbiome_bray_ACR,tree_ACR, check.labels = TRUE)
+
+#code for doing the randomizations:
+val.un <- vector("numeric",1000)
+for (i in 1:1000){
+  CRun.i <-tree_microbiome_bray_ACR
+  CRun.i$tip.label<-sample(tree_microbiome_bray_ACR$tip.label)
+  saveit1<-RF.dist(CRun.i,tree_microbiome_bray_ACR)
+  val.un[[i]]<-saveit1}
+hist.val.un <- hist(val.un)
+hist.val.un
+summary(hist.val.un)
+
+########################### Mantel test ###########################
+
+library(ade4)
+#repeated for all distance matrices and ACR and CYTB
+dist.tree_microbiome_bray_ACR<-cophenetic(tree_microbiome_bray_ACR)
+dist.tree_microbiome_bray_ACRb<-as.dist(dist.tree_microbiome_bray_ACR)
+
+dist.tree_ACR.reduced<-cophenetic(tree_ACR)
+dist.tree_ACR.reduced<-as.dist(dist.tree_ACR)
+
+mantel.rtest(dist.tree_microbiome_bray_ACR, dist.tree_ACR, nrepet = 9999)
+
+
+
+
+
+
